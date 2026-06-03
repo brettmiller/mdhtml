@@ -2,12 +2,6 @@
 
 Renders local markdown files as HTML and serves them in your browser. Requires [`uv`](https://docs.astral.sh/uv/).
 
-## Installation
-
-```sh
-ln -s ../code/github.com/brettmiller/mdhtml/mdhtml ~/bin/mdhtml
-```
-
 ## Usage
 
 ```sh
