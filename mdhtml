@@ -1,0 +1,347 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "markdown",
+#   "pygments",
+# ]
+# ///
+
+"""Serve local markdown files as rendered HTML in your browser."""
+
+import argparse
+import html
+import http.server
+import socket
+import sys
+import threading
+import webbrowser
+from pathlib import Path
+from urllib.parse import quote, unquote
+
+import markdown as _md
+from pygments.formatters import HtmlFormatter
+from pygments.styles import get_all_styles
+
+_PYGMENTS_LIGHT = HtmlFormatter(style="perldoc").get_style_defs(".codehilite")  # may be replaced by --theme
+_PYGMENTS_DARK_FORCED = HtmlFormatter(style="monokai").get_style_defs("html.dark .codehilite")
+_PYGMENTS_DARK_MEDIA = HtmlFormatter(style="monokai").get_style_defs("html:not(.light) .codehilite")
+
+_MD_EXTENSIONS = ["extra", "codehilite", "toc"]
+_MD_CONFIGS = {
+    "codehilite": {"guess_lang": True},
+    "toc": {"permalink": False},
+}
+
+_PAGE_CSS = """
+:root {
+    --bg: #ffffff;
+    --bg-2: #f6f8fa;
+    --text: #24292f;
+    --text-muted: #57606a;
+    --border: #d0d7de;
+    --link: #0969da;
+    --btn-bg: #f6f8fa;
+    --btn-hover: #e0e6ec;
+}
+@media (prefers-color-scheme: dark) {
+    html:not(.light) {
+        --bg: #0d1117;
+        --bg-2: #161b22;
+        --text: #e6edf3;
+        --text-muted: #8b949e;
+        --border: #30363d;
+        --link: #58a6ff;
+        --btn-bg: #21262d;
+        --btn-hover: #30363d;
+    }
+}
+html.dark {
+    --bg: #0d1117;
+    --bg-2: #161b22;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --border: #30363d;
+    --link: #58a6ff;
+    --btn-bg: #21262d;
+    --btn-hover: #30363d;
+}
+html.light {
+    --bg: #ffffff;
+    --bg-2: #f6f8fa;
+    --text: #24292f;
+    --text-muted: #57606a;
+    --border: #d0d7de;
+    --link: #0969da;
+    --btn-bg: #f6f8fa;
+    --btn-hover: #e0e6ec;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--text);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+    transition: background .15s, color .15s;
+}
+.container { max-width: 860px; margin: 0 auto; }
+nav.back { margin-bottom: 1.5rem; font-size: .9rem; }
+nav.back a { color: var(--link); text-decoration: none; }
+nav.back a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 {
+    margin: 1.5rem 0 1rem;
+    font-weight: 600;
+    line-height: 1.25;
+}
+h1 { font-size: 2em; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
+h3 { font-size: 1.25em; }
+p { margin: 0 0 1rem; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 85%;
+    background: var(--bg-2);
+    border-radius: 3px;
+    padding: .2em .4em;
+}
+pre {
+    background: var(--bg-2);
+    border-radius: 6px;
+    padding: 1rem;
+    overflow: auto;
+    margin: 0 0 1rem;
+}
+pre code { background: none; padding: 0; }
+.codehilite { border-radius: 6px; margin: 0 0 1rem; overflow: auto; }
+.codehilite pre { margin: 0; background: transparent; padding: 1rem; }
+blockquote {
+    margin: 0 0 1rem;
+    padding: 0 1em;
+    color: var(--text-muted);
+    border-left: .25em solid var(--border);
+}
+table { border-collapse: collapse; width: 100%; margin-bottom: 1rem; }
+th, td { border: 1px solid var(--border); padding: 6px 13px; }
+tr:nth-child(even) { background: var(--bg-2); }
+th { font-weight: 600; background: var(--bg-2); }
+hr { border: none; border-top: 1px solid var(--border); margin: 1.5rem 0; }
+img { max-width: 100%; height: auto; }
+ul, ol { margin: 0 0 1rem; padding-left: 2em; }
+.index-list { list-style: none; padding: 0; }
+.index-list li { padding: .5rem 0; border-bottom: 1px solid var(--border); }
+.index-list li:last-child { border-bottom: none; }
+.index-list a { font-size: 1.05em; }
+#theme-toggle {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    background: var(--btn-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: .35rem .65rem;
+    font-size: .8rem;
+    cursor: pointer;
+    transition: background .15s;
+    z-index: 100;
+}
+#theme-toggle:hover { background: var(--btn-hover); }
+"""
+
+_TOGGLE_JS = """
+(function () {
+    var btn = document.getElementById('theme-toggle');
+    var root = document.documentElement;
+
+    function isDark() {
+        if (root.classList.contains('dark')) return true;
+        if (root.classList.contains('light')) return false;
+        return window.matchMedia('(prefers-color-scheme: dark)').matches;
+    }
+
+    function update() {
+        btn.textContent = isDark() ? '☀ Light' : '☾ Dark';
+    }
+
+    btn.addEventListener('click', function () {
+        if (isDark()) {
+            root.classList.remove('dark');
+            root.classList.add('light');
+        } else {
+            root.classList.remove('light');
+            root.classList.add('dark');
+        }
+        update();
+    });
+
+    update();
+})();
+"""
+
+
+_forced_mode: str = ""  # "dark", "light", or ""
+
+
+def _build_page(title: str, body: str, show_back: bool = False) -> bytes:
+    back = '<nav class="back"><a href="/">← Index</a></nav>' if show_back else ""
+    cls = f' class="{_forced_mode}"' if _forced_mode else ""
+    return f"""<!DOCTYPE html>
+<html lang="en"{cls}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+{_PYGMENTS_LIGHT}
+{_PYGMENTS_DARK_FORCED}
+@media (prefers-color-scheme: dark) {{
+{_PYGMENTS_DARK_MEDIA}
+}}
+{_PAGE_CSS}
+  </style>
+</head>
+<body>
+  <button id="theme-toggle"></button>
+  <div class="container">
+    {back}
+    {body}
+  </div>
+  <script>{_TOGGLE_JS}</script>
+</body>
+</html>""".encode()
+
+
+def _render(text: str) -> str:
+    return _md.markdown(text, extensions=_MD_EXTENSIONS, extension_configs=_MD_CONFIGS)
+
+
+def _display_name(stem: str) -> str:
+    return stem.replace("-", " ").replace("_", " ").title()
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    files: dict[str, Path]
+    single: bool
+
+    def do_GET(self) -> None:
+        path = unquote(self.path).lstrip("/").split("?")[0]
+
+        if not path:
+            if self.single:
+                self._redirect(f"/{quote(next(iter(self.files)))}")
+            else:
+                self._serve_index()
+        elif path in self.files:
+            self._serve_md(path)
+        else:
+            self._respond(404, b"Not found")
+
+    def _serve_index(self) -> None:
+        items = "\n".join(
+            f'<li><a href="/{quote(name)}">{html.escape(_display_name(fp.stem))}</a></li>'
+            for name, fp in sorted(self.files.items())
+        )
+        body = f"<h1>Markdown Files</h1><ul class='index-list'>{items}</ul>"
+        self._respond(200, _build_page("Index", body))
+
+    def _serve_md(self, name: str) -> None:
+        fp = self.files[name]
+        body = _render(fp.read_text(encoding="utf-8"))
+        self._respond(200, _build_page(_display_name(fp.stem), body, show_back=not self.single))
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def _respond(self, code: int, data: bytes) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_) -> None:
+        pass
+
+
+def _free_port(start: int = 8080) -> int:
+    for port in range(start, start + 100):
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+    raise RuntimeError("No available port in range 8080–8179")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("path", nargs="?", default=".", help="Markdown file or directory (default: .)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dark", action="store_true", help="Force dark mode (default: system)")
+    mode.add_argument("--light", action="store_true", help="Force light mode (default: system)")
+    parser.add_argument(
+        "--theme",
+        metavar="NAME",
+        help="Pygments syntax theme for both modes (default: perldoc / monokai). See --list-themes for options.",
+    )
+    parser.add_argument("--list-themes", action="store_true", help="List available Pygments syntax themes and exit")
+    args = parser.parse_args()
+
+    if args.list_themes:
+        print("\n".join(sorted(get_all_styles())))
+        return
+
+    global _forced_mode, _PYGMENTS_LIGHT, _PYGMENTS_DARK_FORCED, _PYGMENTS_DARK_MEDIA
+    if args.dark:
+        _forced_mode = "dark"
+    elif args.light:
+        _forced_mode = "light"
+
+    if args.theme:
+        if args.theme not in get_all_styles():
+            sys.exit(f"error: unknown theme '{args.theme}'. Run --list-themes for options.")
+        _PYGMENTS_LIGHT = HtmlFormatter(style=args.theme).get_style_defs(".codehilite")
+        _PYGMENTS_DARK_FORCED = HtmlFormatter(style=args.theme).get_style_defs("html.dark .codehilite")
+        _PYGMENTS_DARK_MEDIA = HtmlFormatter(style=args.theme).get_style_defs("html:not(.light) .codehilite")
+
+    target = Path(args.path).expanduser().resolve()
+
+    if target.is_file():
+        if target.suffix.lower() not in {".md", ".markdown"}:
+            sys.exit(f"error: not a markdown file: {target}")
+        files = {target.name: target}
+    elif target.is_dir():
+        found = sorted(
+            f for f in target.iterdir()
+            if f.is_file() and f.suffix.lower() in {".md", ".markdown"}
+        )
+        if not found:
+            sys.exit(f"error: no markdown files found in {target}")
+        files = {f.name: f for f in found}
+    else:
+        sys.exit(f"error: path not found: {target}")
+
+    single = len(files) == 1
+    handler = type("Handler", (_Handler,), {"files": files, "single": single})
+
+    port = _free_port()
+    server = http.server.HTTPServer(("127.0.0.1", port), handler)
+
+    base = f"http://127.0.0.1:{port}"
+    url = f"{base}/{quote(next(iter(files)))}" if single else base
+    print(f"→ {url}  (Ctrl-C to stop)")
+    threading.Timer(0.3, webbrowser.open, args=[url]).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()
