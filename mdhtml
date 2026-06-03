@@ -185,10 +185,11 @@ _TOGGLE_JS = """
 
 
 _forced_mode: str = ""  # "dark", "light", or ""
+_OUTPUT_UNSET = object()
 
 
-def _build_page(title: str, body: str, show_back: bool = False) -> bytes:
-    back = '<nav class="back"><a href="/">← Index</a></nav>' if show_back else ""
+def _build_page(title: str, body: str, show_back: bool = False, back_href: str = "/") -> bytes:
+    back = f'<nav class="back"><a href="{html.escape(back_href)}">← Index</a></nav>' if show_back else ""
     cls = f' class="{_forced_mode}"' if _forced_mode else ""
     return f"""<!DOCTYPE html>
 <html lang="en"{cls}>
@@ -270,6 +271,57 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _write_output(files: dict[str, Path], out_val: str | None, single: bool) -> None:
+    first_src = next(iter(files.values()))
+
+    exact_file: Path | None = None
+    out_dir: Path | None = None
+
+    if out_val is None:
+        out_dir = first_src.parent
+    else:
+        out_path = Path(out_val).expanduser().resolve()
+        if out_path.is_dir():
+            out_dir = out_path
+        elif not out_path.exists():
+            if single and out_path.suffix:
+                exact_file = out_path
+            else:
+                out_dir = out_path
+                out_dir.mkdir(parents=True, exist_ok=True)
+        elif out_path.is_file():
+            if single:
+                exact_file = out_path
+            else:
+                sys.exit(f"error: output path is an existing file, expected a directory: {out_path}")
+        else:
+            sys.exit(f"error: cannot use output path: {out_path}")
+
+    if exact_file is not None:
+        exact_file.parent.mkdir(parents=True, exist_ok=True)
+        body = _render(first_src.read_text(encoding="utf-8"))
+        exact_file.write_bytes(_build_page(_display_name(first_src.stem), body))
+        print(f"→ {exact_file}")
+        return
+
+    assert out_dir is not None
+    for fp in files.values():
+        body = _render(fp.read_text(encoding="utf-8"))
+        out_file = out_dir / (fp.stem + ".html")
+        out_file.write_bytes(_build_page(_display_name(fp.stem), body, show_back=not single, back_href="./index.html"))
+        print(f"→ {out_file}")
+
+    if not single:
+        items = "\n".join(
+            f'<li><a href="./{html.escape(fp.stem)}.html">{html.escape(_display_name(fp.stem))}</a></li>'
+            for fp in sorted(files.values(), key=lambda p: p.name)
+        )
+        body = f"<h1>Markdown Files</h1><ul class='index-list'>{items}</ul>"
+        index_file = out_dir / "index.html"
+        index_file.write_bytes(_build_page("Index", body))
+        print(f"→ {index_file}")
+
+
 def _free_port(start: int = 8080) -> int:
     for port in range(start, start + 100):
         with socket.socket() as s:
@@ -290,6 +342,18 @@ def main() -> None:
         help="Pygments syntax theme for both modes (default: perldoc / monokai). See --list-themes for options.",
     )
     parser.add_argument("--list-themes", action="store_true", help="List available Pygments syntax themes and exit")
+    parser.add_argument(
+        "-o", "--output",
+        nargs="?",
+        const=None,
+        default=_OUTPUT_UNSET,
+        metavar="PATH",
+        help=(
+            "Write HTML files instead of serving. "
+            "PATH may be a directory or (for a single input file) an .html filename. "
+            "Defaults to the source file's directory when omitted."
+        ),
+    )
     args = parser.parse_args()
 
     if args.list_themes:
@@ -327,6 +391,11 @@ def main() -> None:
         sys.exit(f"error: path not found: {target}")
 
     single = len(files) == 1
+
+    if args.output is not _OUTPUT_UNSET:
+        _write_output(files, args.output, single)
+        return
+
     handler = type("Handler", (_Handler,), {"files": files, "single": single})
 
     port = _free_port()
