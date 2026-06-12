@@ -2,8 +2,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "markdown",
-#   "pygments",
+#   "markdown==3.10.2",
+#   "pygments==2.20.0",
 # ]
 # ///
 
